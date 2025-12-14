@@ -189,7 +189,7 @@
             color: rgba(255, 255, 255, 0.5);
         }
 
-        .send-btn {
+        .send-btn, .mic-btn {
             background: linear-gradient(135deg, #667eea, #764ba2);
             border: none;
             border-radius: 12px;
@@ -203,12 +203,15 @@
             gap: 8px;
         }
 
-        .send-btn:hover:not(:disabled) {
+        .mic-btn { background: linear-gradient(135deg, #2ed573, #17c0a8); }
+        .mic-btn.recording { background: #ff4757; }
+
+        .send-btn:hover:not(:disabled), .mic-btn:hover:not(:disabled) {
             transform: scale(1.05);
             box-shadow: 0 5px 20px rgba(102, 126, 234, 0.4);
         }
 
-        .send-btn:disabled {
+        .send-btn:disabled, .mic-btn:disabled {
             opacity: 0.5;
             cursor: not-allowed;
         }
@@ -299,9 +302,10 @@
             <div class="input-wrapper">
                 <textarea 
                     id="userInput" 
-                    placeholder="Type your message..."
+                    placeholder="Type or click 🎤..."
                     rows="1"
                 ></textarea>
+                <button class="mic-btn" id="micBtn">🎤</button>
                 <button class="send-btn" id="sendBtn">
                     Send 🚀
                 </button>
@@ -317,13 +321,20 @@
         class VoiceChat {
             constructor() {
                 this.ws = null;
+                this.voiceWs = null;
                 this.audioQueue = [];
                 this.isPlaying = false;
                 this.currentMessageEl = null;
+                this.isRecording = false;
+                this.isPaused = false;
+                this.mediaStream = null;
+                this.audioContext = null;
+                this.processor = null;
                 
                 this.messagesEl = document.getElementById('messages');
                 this.userInput = document.getElementById('userInput');
                 this.sendBtn = document.getElementById('sendBtn');
+                this.micBtn = document.getElementById('micBtn');
                 this.voiceSelect = document.getElementById('voiceSelect');
                 this.statusDot = document.getElementById('statusDot');
                 this.statusText = document.getElementById('statusText');
@@ -362,6 +373,7 @@
 
             setupEventListeners() {
                 this.sendBtn.addEventListener('click', () => this.sendMessage());
+                this.micBtn.addEventListener('click', () => this.toggleRecording());
                 
                 this.userInput.addEventListener('keydown', (e) => {
                     if (e.key === 'Enter' && !e.shiftKey) {
@@ -374,6 +386,156 @@
                     this.userInput.style.height = 'auto';
                     this.userInput.style.height = Math.min(this.userInput.scrollHeight, 150) + 'px';
                 });
+            }
+
+            async toggleRecording() {
+                console.log('[MIC] Toggle clicked, isRecording:', this.isRecording);
+                if (this.isRecording) {
+                    this.stopRecording();
+                } else {
+                    await this.startRecording();
+                }
+            }
+
+            async startRecording() {
+                console.log('[MIC] Starting recording...');
+                
+                // First get mic permission
+                try {
+                    this.mediaStream = await navigator.mediaDevices.getUserMedia({
+                        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+                    });
+                    console.log('[MIC] Got microphone access');
+                } catch (err) {
+                    console.error('[MIC] Microphone access denied:', err);
+                    alert('Microphone access denied: ' + err.message);
+                    return;
+                }
+                
+                // Connect to voice WebSocket
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${protocol}//${window.location.host}/ws/voice`;
+                console.log('[MIC] Connecting to:', wsUrl);
+                
+                this.voiceWs = new WebSocket(wsUrl);
+                
+                this.voiceWs.onopen = () => {
+                    console.log('[MIC] WebSocket connected');
+                    this.voiceWs.send(JSON.stringify({ voice: this.voiceSelect.value }));
+                    
+                    this.audioContext = new AudioContext();
+                    const actualRate = this.audioContext.sampleRate;
+                    console.log('[MIC] Sample rate:', actualRate);
+                    
+                    const source = this.audioContext.createMediaStreamSource(this.mediaStream);
+                    const bufferSize = 4096; // Fixed buffer size
+                    this.processor = this.audioContext.createScriptProcessor(bufferSize, 1, 1);
+                    
+                    let chunksSent = 0;
+                    this.processor.onaudioprocess = (e) => {
+                        if (!this.isRecording || this.isPaused || this.voiceWs.readyState !== WebSocket.OPEN) return;
+                        
+                        const input = e.inputBuffer.getChannelData(0);
+                        // Resample to 24000Hz
+                        const ratio = 24000 / actualRate;
+                        const outputLen = Math.round(input.length * ratio);
+                        const resampled = new Float32Array(outputLen);
+                        for (let i = 0; i < outputLen; i++) {
+                            const srcIdx = i / ratio;
+                            const idx0 = Math.floor(srcIdx);
+                            const idx1 = Math.min(idx0 + 1, input.length - 1);
+                            const frac = srcIdx - idx0;
+                            resampled[i] = input[idx0] * (1 - frac) + input[idx1] * frac;
+                        }
+                        const pcm = new Int16Array(resampled.length);
+                        for (let i = 0; i < resampled.length; i++) {
+                            pcm[i] = Math.max(-32768, Math.min(32767, resampled[i] * 32768));
+                        }
+                        this.voiceWs.send(pcm.buffer);
+                        chunksSent++;
+                        if (chunksSent % 10 === 0) console.log('[MIC] Chunks sent:', chunksSent);
+                    };
+                    
+                    source.connect(this.processor);
+                    this.processor.connect(this.audioContext.destination);
+                    
+                    this.isRecording = true;
+                    this.micBtn.classList.add('recording');
+                    this.micBtn.textContent = '🔴';
+                    console.log('[MIC] Recording started!');
+                };
+                
+                this.voiceWs.onerror = (err) => {
+                    console.error('[MIC] WebSocket error:', err);
+                };
+                
+                this.voiceWs.onclose = () => {
+                    console.log('[MIC] WebSocket closed');
+                    this.stopRecording();
+                };
+                
+                this.voiceWs.onmessage = (e) => {
+                    console.log('[MIC] Message received:', e.data);
+                    this.handleVoiceMessage(JSON.parse(e.data));
+                };
+            }
+
+            stopRecording() {
+                console.log('[MIC] Stopping recording');
+                this.isRecording = false;
+                this.isPaused = false;
+                this.micBtn.classList.remove('recording');
+                this.micBtn.textContent = '🎤';
+                if (this.processor) { this.processor.disconnect(); this.processor = null; }
+                if (this.audioContext) { this.audioContext.close(); this.audioContext = null; }
+                if (this.mediaStream) { this.mediaStream.getTracks().forEach(t => t.stop()); this.mediaStream = null; }
+                if (this.voiceWs?.readyState === WebSocket.OPEN) { this.voiceWs.close(); }
+                this.voiceWs = null;
+            }
+
+            handleVoiceMessage(data) {
+                switch (data.type) {
+                    case 'transcript':
+                        if (data.is_final) {
+                            this.addMessage(data.text, 'user');
+                            this.currentMessageEl = this.addMessage('', 'assistant', true);
+                        }
+                        break;
+                    case 'token':
+                        if (this.currentMessageEl) {
+                            this.currentMessageEl.querySelector('.text').textContent += data.content;
+                            this.messagesEl.scrollTop = this.messagesEl.scrollHeight;
+                        }
+                        break;
+                    case 'audio':
+                        this.audioQueue.push(data.content);
+                        this.playNextAudio();
+                        break;
+                    case 'pause_mic':
+                        // Stop sending audio while TTS is generating
+                        this.isPaused = true;
+                        this.micBtn.textContent = '⏸️';
+                        console.log('[MIC] Paused for TTS');
+                        break;
+                    case 'resume_mic':
+                        // Resume listening after TTS is done
+                        this.isPaused = false;
+                        if (this.isRecording) {
+                            this.micBtn.textContent = '🔴';
+                        }
+                        console.log('[MIC] Resumed');
+                        break;
+                    case 'done':
+                        if (this.currentMessageEl) {
+                            const cursor = this.currentMessageEl.querySelector('.cursor');
+                            if (cursor) cursor.remove();
+                        }
+                        this.currentMessageEl = null;
+                        break;
+                    case 'error':
+                        console.error('Voice error:', data.message);
+                        break;
+                }
             }
 
             sendMessage() {

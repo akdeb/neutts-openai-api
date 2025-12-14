@@ -8,6 +8,7 @@ from fastapi.responses import StreamingResponse, FileResponse
 from models import TextRequest, OpenAISpeechRequest
 from tts_service import tts_service
 from llm_service import llm_service
+from stt_service import stt_service
 from utils import convert_audio_format, get_media_type_and_filename
 
 app = FastAPI(title="NeuTTS Air Streaming API")
@@ -16,6 +17,7 @@ app = FastAPI(title="NeuTTS Air Streaming API")
 async def startup_event():
     tts_service.initialize_tts()
     llm_service.initialize_llm()
+    stt_service.initialize_stt()
 
 @app.get("/")
 async def read_root():
@@ -244,6 +246,103 @@ async def websocket_chat(websocket: WebSocket):
     
     except WebSocketDisconnect:
         print("WebSocket disconnected")
+
+
+@app.websocket("/ws/voice")
+async def websocket_voice(websocket: WebSocket):
+    """Voice chat: audio in -> STT -> LLM -> TTS -> audio out"""
+    await websocket.accept()
+    
+    voice = "dave"
+    system_prompt = "You are a helpful voice assistant. Be concise."
+    
+    try:
+        while True:
+            message = await websocket.receive()
+            
+            if message.get("type") == "websocket.disconnect":
+                break
+            
+            if "bytes" in message:
+                # Process audio chunk
+                audio_bytes = message["bytes"]
+                audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                
+                result = stt_service.process_audio_chunk(audio, use_vad=True)
+                
+                if result:
+                    await websocket.send_json({
+                        "type": "transcript",
+                        "text": result.text,
+                        "is_final": result.is_final
+                    })
+                    
+                    if result.is_final:
+                        # Pause mic while generating response
+                        await websocket.send_json({"type": "pause_mic"})
+                        
+                        # Generate LLM + TTS response
+                        ref_codes, ref_text = tts_service.get_cached_reference_data(voice)
+                        if ref_codes is None:
+                            await websocket.send_json({"type": "resume_mic"})
+                            continue
+                        
+                        sentence_buffer = SentenceBuffer()
+                        full_response = ""
+                        
+                        for token in llm_service.generate_stream(result.text, system_prompt):
+                            full_response += token
+                            await websocket.send_json({"type": "token", "content": token})
+                            
+                            for sentence in sentence_buffer.add(token):
+                                if len(sentence.strip()) < 3:  # Skip very short text
+                                    continue
+                                try:
+                                    audio_chunks, _ = tts_service.generate_audio_with_timing(sentence, ref_codes, ref_text)
+                                    if audio_chunks:
+                                        wav_data = tts_service.create_wav_data(audio_chunks)
+                                        await websocket.send_json({
+                                            "type": "audio",
+                                            "content": base64.b64encode(wav_data).decode('utf-8'),
+                                            "sentence": sentence
+                                        })
+                                except Exception as e:
+                                    print(f"TTS error for '{sentence}': {e}")
+                        
+                        remaining = sentence_buffer.flush()
+                        if remaining and len(remaining.strip()) >= 3:
+                            try:
+                                audio_chunks, _ = tts_service.generate_audio_with_timing(remaining, ref_codes, ref_text)
+                                if audio_chunks:
+                                    wav_data = tts_service.create_wav_data(audio_chunks)
+                                    await websocket.send_json({
+                                        "type": "audio",
+                                        "content": base64.b64encode(wav_data).decode('utf-8'),
+                                        "sentence": remaining
+                                    })
+                            except Exception as e:
+                                print(f"TTS error for '{remaining}': {e}")
+                        
+                        await websocket.send_json({"type": "done", "full_response": full_response})
+                        await websocket.send_json({"type": "resume_mic"})
+                        stt_service.reset()
+                        
+            elif "text" in message:
+                # Config message
+                import json
+                try:
+                    data = json.loads(message["text"])
+                    if "voice" in data:
+                        voice = data["voice"]
+                    if "system_prompt" in data:
+                        system_prompt = data["system_prompt"]
+                except:
+                    pass
+                    
+    except WebSocketDisconnect:
+        print("Voice WebSocket disconnected")
+    finally:
+        stt_service.reset()
 
 
 if __name__ == "__main__":
