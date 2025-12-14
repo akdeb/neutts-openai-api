@@ -24,3 +24,8 @@ __pycache__/
 
 # Audio artifacts
 *.wav
+
+# Binaries
+api-aarch64*
+api-x86*
+api-universal*
