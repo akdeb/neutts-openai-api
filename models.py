@@ -12,6 +12,48 @@ class TextRequest(BaseModel):
 class OpenAISpeechRequest(BaseModel):
     model: str = "gpt-4o-mini-tts"
     input: str
-    voice: Literal["coral", "dave"] = "coral"
+    voice: Literal["coral", "dave", "jo", "mara", "santa"] = "coral"
     instructions: Optional[str] = None
     response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = "mp3"
+
+
+class PersonalityCreate(BaseModel):
+    name: str
+    prompt: str
+    short_description: str
+    tags: list[str]
+    voice_id: str
+    is_visible: bool = True
+
+class PersonalityUpdate(BaseModel):
+    name: Optional[str] = None
+    prompt: Optional[str] = None
+    short_description: Optional[str] = None
+    tags: Optional[list[str]] = None
+    voice_id: Optional[str] = None
+    is_visible: Optional[bool] = None
+
+class ConversationLog(BaseModel):
+    role: Literal["user", "ai"]
+    transcript: str
+    personality_id: Optional[str] = None
+
+
+class UserCreate(BaseModel):
+    name: str
+    age: Optional[int] = None
+    dob: Optional[str] = None
+    hobbies: list[str] = []
+    personality_type: Optional[str] = None
+    likes: list[str] = []
+    current_personality_id: Optional[str] = None
+
+class UserUpdate(BaseModel):
+    name: Optional[str] = None
+    age: Optional[int] = None
+    dob: Optional[str] = None
+    hobbies: Optional[list[str]] = None
+    personality_type: Optional[str] = None
+    likes: Optional[list[str]] = None
+    current_personality_id: Optional[str] = None
+

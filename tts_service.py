@@ -71,10 +71,9 @@ class TTSService:
         if ref_codes_path and os.path.exists(ref_codes_path):
             if ref_codes_path.endswith('.npy'):
                 ref_codes = np.load(ref_codes_path)
-            else:
-                # Fallback for .pt files if needed
-                import torch
-                ref_codes = torch.load(ref_codes_path).numpy()
+            # else:
+            #     # Fallback for .pt files removed to avoid torch dependency
+            #     pass
         
         if ref_text_path and os.path.exists(ref_text_path):
             with open(ref_text_path, "r") as f:

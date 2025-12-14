@@ -45,10 +45,11 @@ except Exception as e:
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, FileResponse
-from models import TextRequest, OpenAISpeechRequest
+from models import TextRequest, OpenAISpeechRequest, PersonalityCreate, PersonalityUpdate, ConversationLog, UserCreate, UserUpdate
 from tts_service import tts_service
 from llm_service import llm_service
 from stt_service import stt_service
+from db_service import db_service
 from utils import convert_audio_format, get_media_type_and_filename
 from path_utils import get_resource_path
 
@@ -71,6 +72,94 @@ async def read_chat():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "tts_initialized": tts_service.is_initialized()}
+
+# --- Database API ---
+
+@app.post("/personalities")
+async def create_personality(p: PersonalityCreate):
+    return db_service.create_personality(
+        name=p.name,
+        prompt=p.prompt,
+        short_description=p.short_description,
+        tags=p.tags,
+        voice_id=p.voice_id,
+        is_visible=p.is_visible
+    )
+
+@app.get("/personalities")
+async def list_personalities(include_hidden: bool = False):
+    return db_service.get_personalities(include_hidden=include_hidden)
+
+@app.get("/personalities/{p_id}")
+async def get_personality(p_id: str):
+    p = db_service.get_personality(p_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Personality not found")
+    return p
+
+@app.put("/personalities/{p_id}")
+async def update_personality(p_id: str, p: PersonalityUpdate):
+    updated = db_service.update_personality(p_id, **p.dict(exclude_unset=True))
+    if not updated:
+        raise HTTPException(status_code=404, detail="Personality not found")
+    return updated
+
+@app.delete("/personalities/{p_id}")
+async def delete_personality(p_id: str):
+    success = db_service.delete_personality(p_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Personality not found")
+    return {"status": "success"}
+
+@app.get("/conversations")
+async def list_conversations(limit: int = 50, offset: int = 0):
+    return db_service.get_conversations(limit, offset)
+
+@app.delete("/conversations/{c_id}")
+async def delete_conversation(c_id: str):
+    success = db_service.delete_conversation(c_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return {"status": "success"}
+
+@app.post("/users")
+async def create_user(u: UserCreate):
+    return db_service.create_user(
+        name=u.name,
+        age=u.age,
+        dob=u.dob,
+        hobbies=u.hobbies,
+        personality_type=u.personality_type,
+        likes=u.likes,
+        current_personality_id=u.current_personality_id
+    )
+
+@app.get("/users")
+async def list_users():
+    return db_service.get_users()
+
+@app.get("/users/{u_id}")
+async def get_user(u_id: str):
+    u = db_service.get_user(u_id)
+    if not u:
+        raise HTTPException(status_code=404, detail="User not found")
+    return u
+
+@app.put("/users/{u_id}")
+async def update_user(u_id: str, u: UserUpdate):
+    updated = db_service.update_user(u_id, **u.dict(exclude_unset=True))
+    if not updated:
+        raise HTTPException(status_code=404, detail="User not found")
+    return updated
+
+@app.delete("/users/{u_id}")
+async def delete_user(u_id: str):
+    success = db_service.delete_user(u_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"status": "success"}
+
+# --------------------
 
 @app.post("/synthesize")
 async def synthesize_speech(request: TextRequest):
@@ -382,6 +471,11 @@ async def websocket_chat(websocket: WebSocket):
                 await websocket.send_json({"type": "error", "message": "No prompt provided"})
                 continue
             
+            # Log user conversation
+            personality = db_service.get_personality_by_voice(voice)
+            personality_id = personality.id if personality else None
+            db_service.log_conversation(role="user", transcript=prompt, personality_id=personality_id)
+            
             ref_codes, ref_text = tts_service.get_cached_reference_data(voice)
             if ref_codes is None:
                 await websocket.send_json({"type": "error", "message": f"Voice {voice} not found"})
@@ -429,6 +523,8 @@ async def websocket_chat(websocket: WebSocket):
                         print(f"[Chat] Sent final audio packet ({len(wav_data)} bytes)")
                 
                 print("[Chat] Generation complete")
+                # Log AI response
+                db_service.log_conversation(role="ai", transcript=full_response, personality_id=personality_id)
                 await websocket.send_json({"type": "done", "full_response": full_response})
                 
             except Exception as e:
@@ -476,8 +572,12 @@ async def websocket_voice(websocket: WebSocket):
                 # Send greeting on first audio received
                 if not greeted:
                     greeted = True
+                    # Fetch personality for logging
+                    personality = db_service.get_personality_by_voice(voice)
+                    personality_id = personality.id if personality else None
+                    
                     await websocket.send_json({"type": "pause_mic"})
-                    await generate_greeting(websocket, voice, system_prompt, is_esp32=False)
+                    await generate_greeting(websocket, voice, system_prompt, is_esp32=False, personality_id=personality_id)
                     await websocket.send_json({"type": "resume_mic"})
                     stt_service.reset()
                     continue
@@ -496,6 +596,11 @@ async def websocket_voice(websocket: WebSocket):
                     })
                     
                     if result.is_final:
+                        # Log user conversation
+                        personality = db_service.get_personality_by_voice(voice)
+                        personality_id = personality.id if personality else None
+                        db_service.log_conversation(role="user", transcript=result.text, personality_id=personality_id)
+
                         # Pause mic while generating response
                         await websocket.send_json({"type": "pause_mic"})
                         
@@ -540,6 +645,9 @@ async def websocket_voice(websocket: WebSocket):
                                     })
                             except Exception as e:
                                 print(f"TTS error for '{remaining}': {e}")
+                        
+                        # Log AI response
+                        db_service.log_conversation(role="ai", transcript=full_response, personality_id=personality_id)
                         
                         await websocket.send_json({"type": "done", "full_response": full_response})
                         await websocket.send_json({"type": "resume_mic"})
@@ -588,7 +696,7 @@ async def send_audio_chunked(websocket: WebSocket, pcm_data: np.ndarray, chunk_s
         return False
 
 
-async def generate_greeting(websocket: WebSocket, voice: str, system_prompt: str, is_esp32: bool = False, opus_streamer: Optional['OpusStreamer'] = None):
+async def generate_greeting(websocket: WebSocket, voice: str, system_prompt: str, is_esp32: bool = False, opus_streamer: Optional['OpusStreamer'] = None, personality_id: Optional[str] = None):
     """Generate and send initial greeting from the assistant."""
     ref_codes, ref_text = tts_service.get_cached_reference_data(voice)
     if ref_codes is None:
@@ -690,6 +798,9 @@ async def generate_greeting(websocket: WebSocket, voice: str, system_prompt: str
             except Exception as e:
                 print(f"Greeting TTS error: {e}")
         
+        # Log greeting
+        db_service.log_conversation(role="ai", transcript=full_response, personality_id=personality_id)
+
         if is_esp32:
             try:
                 await websocket.send_json({"type": "server", "msg": "RESPONSE.COMPLETE"})
@@ -750,7 +861,11 @@ async def websocket_esp32(websocket: WebSocket):
     print("[ESP32] Client connected")
     
     # Send initial greeting
-    await generate_greeting(websocket, voice, system_prompt, is_esp32=True, opus_streamer=opus_streamer)
+    # Fetch personality for logging
+    personality = db_service.get_personality_by_voice(voice)
+    personality_id = personality.id if personality else None
+    
+    await generate_greeting(websocket, voice, system_prompt, is_esp32=True, opus_streamer=opus_streamer, personality_id=personality_id)
     
     try:
         while True:
@@ -783,6 +898,11 @@ async def websocket_esp32(websocket: WebSocket):
                 
                 if result and result.is_final:
                     print(f"[ESP32] Transcript: {result.text}")
+                    
+                    # Log user conversation
+                    personality = db_service.get_personality_by_voice(voice)
+                    personality_id = personality.id if personality else None
+                    db_service.log_conversation(role="user", transcript=result.text, personality_id=personality_id)
                     
                     # Notify audio committed
                     try:
@@ -888,6 +1008,10 @@ async def websocket_esp32(websocket: WebSocket):
                                 except Exception as e:
                                     print(f"[ESP32] TTS error: {e}")
                     
+                    # Log AI response
+                    if client_active:
+                        db_service.log_conversation(role="ai", transcript=full_response, personality_id=personality_id)
+
                     if not client_active:
                         print("[ESP32] Client disconnected during generation")
                         break

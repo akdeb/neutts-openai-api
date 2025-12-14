@@ -32,6 +32,7 @@ hiddenimports = [
     'websockets.legacy.server',
     'soundfile',
     'opuslib',
+    'onnxruntime',
 ]
 
 # Collect all MLX and other complex dependencies
@@ -67,7 +68,9 @@ a = Analysis(
     excludes=[
         'torch', 'torch.distributed', 'torch.testing', 'torch.utils.tensorboard', 'torchaudio', 'torchvision',
         'pandas', 'pyarrow', 'scipy', 'sklearn', 'numba', 'llvmlite', 'matplotlib', 'PIL',
-        'librosa', 'perth', 'pooch', 'lazy_loader'
+        'librosa', 'perth', 'pooch', 'lazy_loader',
+        'transformers', 'tokenizers', 'safetensors', 'accelerate', 'sympy', 'networkx',
+        'neucodec'
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
