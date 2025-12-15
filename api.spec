@@ -1,5 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 from PyInstaller.utils.hooks import collect_all
+
+spec_file = globals().get('__file__')
+project_root = os.path.abspath(os.path.dirname(spec_file)) if spec_file else os.path.abspath(os.getcwd())
 
 datas = [
     ('neuttsair', 'neuttsair'),
@@ -9,6 +13,13 @@ datas = [
 ]
 binaries = []
 hiddenimports = [
+    'db_service',
+    'models',
+    'tts_service',
+    'llm_service',
+    'stt_service',
+    'utils',
+    'path_utils',
     'uvicorn.logging',
     'uvicorn.loops',
     'uvicorn.loops.auto',
@@ -58,7 +69,7 @@ block_cipher = None
 
 a = Analysis(
     ['openai.py'],
-    pathex=[],
+    pathex=[project_root],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

@@ -34,6 +34,7 @@ import re
 import json
 import base64
 import asyncio
+import uuid
 import numpy as np
 from typing import Optional
 try:
@@ -44,8 +45,9 @@ except Exception as e:
     OPUS_AVAILABLE = False
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
-from models import TextRequest, OpenAISpeechRequest, PersonalityCreate, PersonalityUpdate, ConversationLog, UserCreate, UserUpdate
+from models import TextRequest, OpenAISpeechRequest, PersonalityCreate, PersonalityUpdate, UserCreate, UserUpdate, ActiveUserState, AppModeState, ModelsUpdate
 from tts_service import tts_service
 from llm_service import llm_service
 from stt_service import stt_service
@@ -54,6 +56,19 @@ from utils import convert_audio_format, get_media_type_and_filename
 from path_utils import get_resource_path
 
 app = FastAPI(title="NeuTTS Air Streaming API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:1420",
+        "http://127.0.0.1:1420",
+        "tauri://localhost",
+        "http://tauri.localhost",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.on_event("startup")
 async def startup_event():
@@ -72,6 +87,23 @@ async def read_chat():
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "tts_initialized": tts_service.is_initialized()}
+
+@app.get("/active-user")
+async def get_active_user():
+    return {"user_id": db_service.get_active_user_id()}
+
+@app.put("/active-user")
+async def set_active_user(payload: ActiveUserState):
+    db_service.set_active_user_id(payload.user_id)
+    return {"user_id": db_service.get_active_user_id()}
+
+@app.get("/app-mode")
+async def get_app_mode():
+    return {"mode": db_service.get_app_mode()}
+
+@app.put("/app-mode")
+async def set_app_mode(payload: AppModeState):
+    return {"mode": db_service.set_app_mode(payload.mode)}
 
 # --- Database API ---
 
@@ -112,8 +144,52 @@ async def delete_personality(p_id: str):
     return {"status": "success"}
 
 @app.get("/conversations")
-async def list_conversations(limit: int = 50, offset: int = 0):
-    return db_service.get_conversations(limit, offset)
+async def list_conversations(limit: int = 50, offset: int = 0, session_id: Optional[str] = None):
+    return db_service.get_conversations(limit, offset, session_id=session_id)
+
+@app.get("/sessions")
+async def list_sessions(limit: int = 50, offset: int = 0):
+    return db_service.get_sessions(limit=limit, offset=offset)
+
+@app.get("/device-status")
+async def get_device_status():
+    return db_service.get_device_status()
+
+@app.get("/models")
+async def get_models():
+    return {
+        "llm": {
+            "backend": "llama.cpp",
+            "repo": llm_service.model_repo,
+            "file": llm_service.model_file,
+            "context_window": 2048,
+            "loaded": llm_service.is_initialized(),
+        },
+        "tts": {
+            "backend": "NeuTTSAir",
+            "backbone_repo": "neuphonic/neutts-air-q4-gguf",
+            "codec_repo": "neuphonic/neucodec-onnx-decoder",
+            "loaded": tts_service.is_initialized(),
+        },
+    }
+
+@app.put("/models")
+async def set_models(payload: ModelsUpdate):
+    changed = False
+    if payload.model_repo and payload.model_repo != llm_service.model_repo:
+        llm_service.model_repo = payload.model_repo
+        changed = True
+    if payload.model_file and payload.model_file != llm_service.model_file:
+        llm_service.model_file = payload.model_file
+        changed = True
+
+    if changed:
+        try:
+            llm_service.unload()
+        except Exception:
+            pass
+
+    return await get_models()
 
 @app.delete("/conversations/{c_id}")
 async def delete_conversation(c_id: str):
@@ -452,6 +528,10 @@ class OpusStreamer:
 async def websocket_chat(websocket: WebSocket):
     await websocket.accept()
     print("[Chat] WebSocket connected")
+
+    session_id = str(uuid.uuid4())
+    websocket._elato_session_id = session_id
+    db_service.start_session(session_id=session_id, client_type="computer")
     
     try:
         while True:
@@ -476,7 +556,7 @@ async def websocket_chat(websocket: WebSocket):
             # Log user conversation
             personality = db_service.get_personality_by_voice(voice)
             personality_id = personality.id if personality else None
-            db_service.log_conversation(role="user", transcript=prompt, personality_id=personality_id)
+            db_service.log_conversation(role="user", transcript=prompt, session_id=session_id)
             
             ref_codes, ref_text = tts_service.get_cached_reference_data(voice)
             if ref_codes is None:
@@ -526,7 +606,7 @@ async def websocket_chat(websocket: WebSocket):
                 
                 print("[Chat] Generation complete")
                 # Log AI response
-                db_service.log_conversation(role="ai", transcript=full_response, personality_id=personality_id)
+                db_service.log_conversation(role="ai", transcript=full_response, session_id=session_id)
                 await websocket.send_json({"type": "done", "full_response": full_response})
                 
             except Exception as e:
@@ -538,6 +618,10 @@ async def websocket_chat(websocket: WebSocket):
     except WebSocketDisconnect:
         print("[Chat] WebSocket disconnected")
     finally:
+        try:
+            db_service.end_session(session_id)
+        except Exception:
+            pass
         print("[Chat] Cleaning up chat resources... (Keeping models loaded)")
         # llm_service.unload()
         # tts_service.unload()
@@ -561,6 +645,9 @@ async def websocket_voice(websocket: WebSocket):
     
     voice = "dave"
     system_prompt = "You are a helpful voice assistant. Be concise."
+    session_id = str(uuid.uuid4())
+    websocket._elato_session_id = session_id
+    db_service.start_session(session_id=session_id, client_type="computer")
     greeted = False
     
     try:
@@ -601,7 +688,7 @@ async def websocket_voice(websocket: WebSocket):
                         # Log user conversation
                         personality = db_service.get_personality_by_voice(voice)
                         personality_id = personality.id if personality else None
-                        db_service.log_conversation(role="user", transcript=result.text, personality_id=personality_id)
+                        db_service.log_conversation(role="user", transcript=result.text, session_id=session_id)
 
                         # Pause mic while generating response
                         await websocket.send_json({"type": "pause_mic"})
@@ -649,7 +736,7 @@ async def websocket_voice(websocket: WebSocket):
                                 print(f"TTS error for '{remaining}': {e}")
                         
                         # Log AI response
-                        db_service.log_conversation(role="ai", transcript=full_response, personality_id=personality_id)
+                        db_service.log_conversation(role="ai", transcript=full_response, session_id=session_id)
                         
                         await websocket.send_json({"type": "done", "full_response": full_response})
                         await websocket.send_json({"type": "resume_mic"})
@@ -671,6 +758,10 @@ async def websocket_voice(websocket: WebSocket):
         print("Voice WebSocket disconnected")
     finally:
         stt_service.reset()
+        try:
+            db_service.end_session(session_id)
+        except Exception:
+            pass
         print("Cleaning up voice resources... (Keeping models loaded)")
         # stt_service.unload()
         # llm_service.unload()
@@ -801,7 +892,8 @@ async def generate_greeting(websocket: WebSocket, voice: str, system_prompt: str
                 print(f"Greeting TTS error: {e}")
         
         # Log greeting
-        db_service.log_conversation(role="ai", transcript=full_response, personality_id=personality_id)
+        session_id = getattr(websocket, "_elato_session_id", None)
+        db_service.log_conversation(role="ai", transcript=full_response, session_id=session_id)
 
         if is_esp32:
             try:
@@ -828,6 +920,17 @@ async def websocket_esp32(websocket: WebSocket):
     - Sends: Opus-encoded audio + JSON control messages
     """
     await websocket.accept()
+
+    if db_service.get_app_mode() != "chat":
+        try:
+            await websocket.send_json({"type": "error", "message": "ESP32 is disabled unless the app is in Chat mode"})
+        except Exception:
+            pass
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        return
     
     # Lazy init on connection
     if not stt_service.is_initialized():
@@ -843,15 +946,39 @@ async def websocket_esp32(websocket: WebSocket):
     voice = "dave"
     system_prompt = "You are a helpful voice assistant. Be concise and conversational."
     input_sample_rate = 16000  # ESP32 mic sample rate
+
+    session_id = str(uuid.uuid4())
+    websocket._elato_session_id = session_id
+
+    try:
+        db_service.set_device_status(True, session_id=session_id)
+    except Exception:
+        pass
+
+    # If UI selected an active user + personality, use it for this session.
+    active_user_id = db_service.get_active_user_id()
+    if active_user_id:
+        active_user = db_service.get_user(active_user_id)
+        if active_user and active_user.current_personality_id:
+            p = db_service.get_personality(active_user.current_personality_id)
+            if p:
+                voice = p.voice_id
+                system_prompt = p.prompt
     
     # Initialize Opus Streamer
     opus_streamer = OpusStreamer(sample_rate=24000, frame_duration_ms=60)
     
     # Send auth response
     try:
+        volume_control = 70
+        if active_user_id:
+            active_user = db_service.get_user(active_user_id)
+            if active_user and active_user.device_volume is not None:
+                volume_control = active_user.device_volume
+
         await websocket.send_json({
             "type": "auth",
-            "volume_control": 70,
+            "volume_control": volume_control,
             "pitch_factor": 1.0,
             "is_ota": False,
             "is_reset": False
@@ -866,6 +993,8 @@ async def websocket_esp32(websocket: WebSocket):
     # Fetch personality for logging
     personality = db_service.get_personality_by_voice(voice)
     personality_id = personality.id if personality else None
+
+    db_service.start_session(session_id=session_id, client_type="device", user_id=active_user_id, personality_id=personality_id)
     
     await generate_greeting(websocket, voice, system_prompt, is_esp32=True, opus_streamer=opus_streamer, personality_id=personality_id)
     
@@ -904,7 +1033,7 @@ async def websocket_esp32(websocket: WebSocket):
                     # Log user conversation
                     personality = db_service.get_personality_by_voice(voice)
                     personality_id = personality.id if personality else None
-                    db_service.log_conversation(role="user", transcript=result.text, personality_id=personality_id)
+                    db_service.log_conversation(role="user", transcript=result.text, session_id=session_id)
                     
                     # Notify audio committed
                     try:
@@ -1012,7 +1141,7 @@ async def websocket_esp32(websocket: WebSocket):
                     
                     # Log AI response
                     if client_active:
-                        db_service.log_conversation(role="ai", transcript=full_response, personality_id=personality_id)
+                        db_service.log_conversation(role="ai", transcript=full_response, session_id=session_id)
 
                     if not client_active:
                         print("[ESP32] Client disconnected during generation")
@@ -1037,14 +1166,23 @@ async def websocket_esp32(websocket: WebSocket):
                         voice = data["voice"]
                     if "system_prompt" in data:
                         system_prompt = data["system_prompt"]
-                except:
+                except Exception:
                     pass
-                    
+
     except WebSocketDisconnect:
-        print("[ESP32] Client disconnected")
+        print("[ESP32] WebSocket disconnected")
     finally:
+        try:
+            db_service.end_session(session_id)
+        except Exception:
+            pass
+        try:
+            db_service.set_device_status(False, session_id=None)
+        except Exception:
+            pass
         stt_service.reset()
-        print("[ESP32] Cleaning up resources... (Keeping models loaded)")
+        opus_streamer.reset()
+        print("[ESP32] Cleaning up ESP32 resources... (Keeping models loaded)")
         # stt_service.unload()
         # llm_service.unload()
         # tts_service.unload()

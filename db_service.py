@@ -24,7 +24,7 @@ class Conversation:
     role: str  # 'user' or 'ai'
     transcript: str
     timestamp: float
-    personality_id: Optional[str] = None  # To track which personality was spoken to
+    session_id: Optional[str] = None
 
 @dataclass
 class User:
@@ -38,6 +38,16 @@ class User:
     current_personality_id: Optional[str]
     user_type: str = "family"
     device_volume: int = 70
+
+@dataclass
+class Session:
+    id: str  # session_id
+    started_at: float
+    ended_at: Optional[float]
+    duration_sec: Optional[float]
+    client_type: str  # 'computer' | 'device'
+    user_id: Optional[str]
+    personality_id: Optional[str]
 
 class DBService:
     def __init__(self, db_path: str = DB_PATH):
@@ -65,7 +75,13 @@ class DBService:
             
         if "device_volume" not in columns:
             cursor.execute("ALTER TABLE users ADD COLUMN device_volume INTEGER DEFAULT 70")
-            
+
+        # Check conversations table columns
+        cursor.execute("PRAGMA table_info(conversations)")
+        convo_columns = [row["name"] for row in cursor.fetchall()]
+        if "session_id" not in convo_columns:
+            cursor.execute("ALTER TABLE conversations ADD COLUMN session_id TEXT")
+
         conn.commit()
         conn.close()
 
@@ -75,6 +91,29 @@ class DBService:
         
         # Enable WAL mode for better concurrency
         cursor.execute("PRAGMA journal_mode=WAL;")
+
+        # App state table (simple key/value store)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS app_state (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+
+        # Sessions table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                started_at REAL NOT NULL,
+                ended_at REAL,
+                duration_sec REAL,
+                client_type TEXT NOT NULL,
+                user_id TEXT,
+                personality_id TEXT,
+                FOREIGN KEY (user_id) REFERENCES users (id),
+                FOREIGN KEY (personality_id) REFERENCES personalities (id)
+            )
+        """)
         
         # Personalities table
         cursor.execute("""
@@ -96,8 +135,7 @@ class DBService:
                 role TEXT NOT NULL,
                 transcript TEXT NOT NULL,
                 timestamp REAL NOT NULL,
-                personality_id TEXT,
-                FOREIGN KEY (personality_id) REFERENCES personalities (id)
+                session_id TEXT
             )
         """)
 
@@ -120,6 +158,135 @@ class DBService:
         
         conn.commit()
         conn.close()
+
+    def get_active_user_id(self) -> Optional[str]:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM app_state WHERE key = ?", ("active_user_id",))
+        row = cursor.fetchone()
+        conn.close()
+        return row["value"] if row and row["value"] else None
+
+    def set_active_user_id(self, user_id: Optional[str]) -> None:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO app_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("active_user_id", user_id)
+        )
+        conn.commit()
+        conn.close()
+
+    def get_app_mode(self) -> str:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM app_state WHERE key = ?", ("app_mode",))
+        row = cursor.fetchone()
+        conn.close()
+        return (row["value"] if row and row["value"] else None) or "idle"
+
+    def set_app_mode(self, mode: Optional[str]) -> str:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO app_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("app_mode", mode or "idle")
+        )
+        conn.commit()
+        conn.close()
+        return self.get_app_mode()
+
+    def get_device_status(self) -> Dict[str, Any]:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("SELECT key, value FROM app_state WHERE key IN (?, ?)", ("esp32_connected", "esp32_session_id"))
+        rows = cursor.fetchall()
+        conn.close()
+
+        data = {row["key"]: row["value"] for row in rows}
+        connected = (data.get("esp32_connected") or "0") == "1"
+        return {
+            "connected": connected,
+            "session_id": data.get("esp32_session_id") if connected else None,
+        }
+
+    def set_device_status(self, connected: bool, session_id: Optional[str] = None) -> None:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO app_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("esp32_connected", "1" if connected else "0")
+        )
+        cursor.execute(
+            "INSERT INTO app_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            ("esp32_session_id", session_id if connected else None)
+        )
+        conn.commit()
+        conn.close()
+
+    def start_session(self, session_id: str, client_type: str, user_id: Optional[str] = None, personality_id: Optional[str] = None) -> None:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        started_at = time.time()
+
+        cursor.execute("PRAGMA table_info(sessions)")
+        session_columns = [row["name"] for row in cursor.fetchall()]
+
+        if "channel" in session_columns:
+            cursor.execute(
+                "INSERT OR IGNORE INTO sessions (id, started_at, ended_at, duration_sec, client_type, channel, user_id, personality_id) VALUES (?, ?, NULL, NULL, ?, ?, ?, ?)",
+                (session_id, started_at, client_type, "chat", user_id, personality_id)
+            )
+        else:
+            cursor.execute(
+                "INSERT OR IGNORE INTO sessions (id, started_at, ended_at, duration_sec, client_type, user_id, personality_id) VALUES (?, ?, NULL, NULL, ?, ?, ?)",
+                (session_id, started_at, client_type, user_id, personality_id)
+            )
+        conn.commit()
+        conn.close()
+
+    def end_session(self, session_id: str) -> None:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        ended_at = time.time()
+        cursor.execute("SELECT started_at, ended_at FROM sessions WHERE id = ?", (session_id,))
+        row = cursor.fetchone()
+        if row and row["started_at"] and not row["ended_at"]:
+            duration = ended_at - row["started_at"]
+            cursor.execute(
+                "UPDATE sessions SET ended_at = ?, duration_sec = ? WHERE id = ?",
+                (ended_at, duration, session_id)
+            )
+        conn.commit()
+        conn.close()
+
+    def get_sessions(self, limit: int = 50, offset: int = 0) -> List[Session]:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(sessions)")
+        session_columns = [row["name"] for row in cursor.fetchall()]
+
+        cursor.execute(
+            "SELECT * FROM sessions ORDER BY started_at DESC LIMIT ? OFFSET ?",
+            (limit, offset)
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        items: List[Session] = []
+        for row in rows:
+            items.append(
+                Session(
+                    id=row["id"],
+                    started_at=row["started_at"],
+                    ended_at=row["ended_at"],
+                    duration_sec=row["duration_sec"],
+                    client_type=row["client_type"],
+                    user_id=row["user_id"] if "user_id" in session_columns else None,
+                    personality_id=row["personality_id"] if "personality_id" in session_columns else None,
+                )
+            )
+        return items
 
     def _seed_defaults(self):
         defaults = [
@@ -298,28 +465,34 @@ class DBService:
 
     # --- Conversations CRUD ---
 
-    def log_conversation(self, role: str, transcript: str, personality_id: Optional[str] = None) -> Conversation:
+    def log_conversation(self, role: str, transcript: str, session_id: Optional[str] = None) -> Conversation:
         c_id = str(uuid.uuid4())
         timestamp = time.time()
         
         conn = self._get_conn()
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO conversations (id, role, transcript, timestamp, personality_id) VALUES (?, ?, ?, ?, ?)",
-            (c_id, role, transcript, timestamp, personality_id)
+            "INSERT INTO conversations (id, role, transcript, timestamp, session_id) VALUES (?, ?, ?, ?, ?)",
+            (c_id, role, transcript, timestamp, session_id)
         )
         conn.commit()
         conn.close()
         
-        return Conversation(c_id, role, transcript, timestamp, personality_id)
+        return Conversation(c_id, role, transcript, timestamp, session_id)
 
-    def get_conversations(self, limit: int = 50, offset: int = 0) -> List[Conversation]:
+    def get_conversations(self, limit: int = 50, offset: int = 0, session_id: Optional[str] = None) -> List[Conversation]:
         conn = self._get_conn()
         cursor = conn.cursor()
-        cursor.execute(
-            "SELECT * FROM conversations ORDER BY timestamp DESC LIMIT ? OFFSET ?",
-            (limit, offset)
-        )
+        if session_id:
+            cursor.execute(
+                "SELECT * FROM conversations WHERE session_id = ? ORDER BY timestamp ASC",
+                (session_id,)
+            )
+        else:
+            cursor.execute(
+                "SELECT * FROM conversations ORDER BY timestamp DESC LIMIT ? OFFSET ?",
+                (limit, offset)
+            )
         rows = cursor.fetchall()
         conn.close()
         
@@ -329,21 +502,20 @@ class DBService:
                 role=row["role"],
                 transcript=row["transcript"],
                 timestamp=row["timestamp"],
-                personality_id=row["personality_id"]
+                session_id=row["session_id"] if "session_id" in row.keys() else None
             )
-            for row in rows,
-                   user_type: str = "family", device_volume: int = 70
+            for row in rows
         ]
-        
+
     def delete_conversation(self, c_id: str) -> bool:
         conn = self._get_conn()
-        cursor = conn.cursor()d, user_type, evice_volume
-        cursor.execute("DELETE FROM conversat, ?, ?ions WHERE id = ?", (c_id,))
-        success = cursor.rowcount > 0, user_type, device_volume
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM conversations WHERE id = ?", (c_id,))
+        success = cursor.rowcount > 0
         conn.commit()
         conn.close()
         return success
-, user_type, device_volume
+
     def clear_conversations(self):
         conn = self._get_conn()
         cursor = conn.cursor()
@@ -355,20 +527,19 @@ class DBService:
 
     def create_user(self, name: str, age: Optional[int] = None, dob: Optional[str] = None, 
                    hobbies: List[str] = [], personality_type: Optional[str] = None, 
-                   likes: List[str] = [], current_personality_id: Optional[str] = None) -> User:
+                   likes: List[str] = [], current_personality_id: Optional[str] = None,
+                   user_type: str = "family", device_volume: int = 70) -> User:
         u_id = str(uuid.uuid4())
         conn = self._get_conn()
         cursor = conn.cursor()
         cursor.execute(
-            """INSERT INTO users (id, name, age, dob, hobbies, personality_type, likes, current_personality_id) 
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",ity_d"],
-                user_type=row["user_pe"] if "usertype" in row.keys() else "famly",
-                device_volume=row["evice_volume if "device_volume" in row.keys() else 70
-            (u_id, name, age, dob, json.dumps(hobbies), personality_type, json.dumps(likes), current_personality_id)
+            """INSERT INTO users (id, name, age, dob, hobbies, personality_type, likes, current_personality_id, user_type, device_volume) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (u_id, name, age, dob, json.dumps(hobbies), personality_type, json.dumps(likes), current_personality_id, user_type, device_volume)
         )
         conn.commit()
         conn.close()
-        return User(u_id, name, age, dob, hobbies, personality_type, likes, current_personality_id)
+        return User(u_id, name, age, dob, hobbies, personality_type, likes, current_personality_id, user_type, device_volume)
 
     def get_users(self) -> List[User]:
         conn = self._get_conn()
@@ -384,11 +555,11 @@ class DBService:
                 age=row["age"],
                 dob=row["dob"],
                 hobbies=json.loads(row["hobbies"]) if row["hobbies"] else [],
-                personality_type=row["personality_type"],,
+                personality_type=row["personality_type"],
+                likes=json.loads(row["likes"]) if row["likes"] else [],
+                current_personality_id=row["current_personality_id"],
                 user_type=row["user_type"] if "user_type" in row.keys() else "family",
-                device_volume=row["device_volume"] if "device_volume" in row.keys(  else 70   likes=json.loads(row["likes"]) if row["likes"] else [],
-            )
-                current_personality_id=row["current_personality_id"]
+                device_volume=row["device_volume"] if "device_volume" in row.keys() else 70
             )
             for row in rows
         ]
@@ -409,7 +580,9 @@ class DBService:
                 hobbies=json.loads(row["hobbies"]) if row["hobbies"] else [],
                 personality_type=row["personality_type"],
                 likes=json.loads(row["likes"]) if row["likes"] else [],
-                current_personality_id=row["current_personality_id"]
+                current_personality_id=row["current_personality_id"],
+                user_type=row["user_type"] if "user_type" in row.keys() else "family",
+                device_volume=row["device_volume"] if "device_volume" in row.keys() else 70
             )
         return None
 
@@ -418,13 +591,7 @@ class DBService:
         if not current:
             return None
             
-        fields = []"])
-        if "user_type" in kwargs:
-            fields.append("user_type = ?")
-            values.append(kwargs["user_type"])
-        if "device_volume" in kwargs:
-            fields.append("device_volume = ?")
-            values.append(kwargs["device_volume
+        fields = []
         values = []
         
         if "name" in kwargs:
@@ -448,6 +615,12 @@ class DBService:
         if "current_personality_id" in kwargs:
             fields.append("current_personality_id = ?")
             values.append(kwargs["current_personality_id"])
+        if "user_type" in kwargs:
+            fields.append("user_type = ?")
+            values.append(kwargs["user_type"])
+        if "device_volume" in kwargs:
+            fields.append("device_volume = ?")
+            values.append(kwargs["device_volume"])
             
         if not fields:
             return current

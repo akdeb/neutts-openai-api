@@ -36,7 +36,20 @@ class PersonalityUpdate(BaseModel):
 class ConversationLog(BaseModel):
     role: Literal["user", "ai"]
     transcript: str
-    personality_id: Optional[str] = None
+    session_id: Optional[str] = None
+
+
+class ActiveUserState(BaseModel):
+    user_id: Optional[str] = None
+
+
+class AppModeState(BaseModel):
+    mode: Optional[str] = None
+
+
+class ModelsUpdate(BaseModel):
+    model_repo: Optional[str] = None
+    model_file: Optional[str] = None
 
 
 class UserCreate(BaseModel):

@@ -1,8 +1,21 @@
 import { Link, useLocation } from 'react-router-dom';
-import { Users, MessageSquare, Settings, Mic2 } from 'lucide-react';
+import { Users, MessageSquare, Settings, Mic2, Lock } from 'lucide-react';
 import clsx from 'clsx';
+import { useActiveUser } from '../state/ActiveUserContext';
+import { useEffect, useState } from 'react';
+import { api } from '../api';
 
-const NavItem = ({ to, icon: Icon, label }: { to: string; icon: any; label: string }) => {
+const NavItem = ({
+  to,
+  icon: Icon,
+  label,
+  trailingIcon: TrailingIcon,
+}: {
+  to: string;
+  icon: any;
+  label: string;
+  trailingIcon?: any;
+}) => {
   const location = useLocation();
   const isActive = location.pathname === to;
 
@@ -10,43 +23,100 @@ const NavItem = ({ to, icon: Icon, label }: { to: string; icon: any; label: stri
     <Link
       to={to}
       className={clsx(
-        "flex items-center gap-3 px-4 py-3 border-2 border-black transition-all hover:bg-[#eee8d5]",
+        "flex items-center gap-3 px-4 py-3 border border-black rounded-[18px] transition-colors hover:bg-[#fff3b0]",
         isActive 
-          ? "bg-[#2aa198] text-white shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] translate-x-[2px] translate-y-[2px]" 
-          : "bg-white shadow-[4px_4px_0px_0px_rgba(0,0,0,1)] hover:translate-x-[1px] hover:translate-y-[1px] hover:shadow-[3px_3px_0px_0px_rgba(0,0,0,1)]"
+          ? "bg-[#ffd400] text-black" 
+          : "bg-white"
       )}
     >
       <Icon size={20} />
-      <span className="font-bold">{label}</span>
+      <span className="font-bold flex-1">{label}</span>
+      {TrailingIcon && <TrailingIcon size={16} className="opacity-70" />}
     </Link>
   );
 };
 
 export const Sidebar = () => {
+  const { users, activeUserId, activeUser, setActiveUserId } = useActiveUser();
+  const [activePersonalityName, setActivePersonalityName] = useState<string | null>(null);
+  const [deviceConnected, setDeviceConnected] = useState<boolean>(false);
+  const [deviceSessionId, setDeviceSessionId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const load = async () => {
+      try {
+        const ds = await api.getDeviceStatus().catch(() => ({ connected: false, session_id: null }));
+        if (!cancelled) {
+          setDeviceConnected(!!ds?.connected);
+          setDeviceSessionId(ds?.session_id || null);
+        }
+
+        const selectedId = activeUser?.current_personality_id;
+        if (!selectedId) {
+          if (!cancelled) setActivePersonalityName(null);
+          return;
+        }
+
+        const ps = await api.getPersonalities(true).catch(() => []);
+        const selected = ps.find((p: any) => p.id === selectedId);
+        if (!cancelled) setActivePersonalityName(selected?.name || null);
+      } catch {
+        // ignore
+      }
+    };
+
+    load();
+    const id = window.setInterval(load, 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [activeUser?.current_personality_id]);
+
   return (
-    <div className="w-64 bg-[#fdf6e3] border-r-2 border-black p-4 flex flex-col gap-4 h-screen">
-      <div className="mb-6 p-4 border-2 border-black bg-[#ff6b6b] text-white shadow-[4px_4px_0px_0px_rgba(0,0,0,1)]">
-        <h1 className="text-2xl font-black tracking-tighter">ELATO</h1>
-        <p className="text-xs font-mono opacity-90">AI COMPANION v1.0</p>
+    <div className="w-64 shrink-0 bg-[#f6f0e6] border-r-2 border-black p-4 flex flex-col gap-4 h-full overflow-y-auto overscroll-contain">
+      <div className="mb-6 p-4 border-2 border-black bg-[#9b5cff] text-white rounded-[24px]">
+        <h1 className="text-2xl font-black tracking-wider brand-font">ELATO</h1>
+        <p className="text-xs font-mono opacity-90">Epic Local AI Toys</p>
+
+        <div className="mt-4">
+          <div className="text-[10px] font-bold uppercase tracking-wider opacity-90 mb-1">
+            Active User
+          </div>
+          <select
+            className="w-full px-3 py-2 bg-white text-black border-2 border-black rounded-[18px]"
+            value={activeUserId || ''}
+            onChange={(e) => setActiveUserId(e.target.value || null)}
+          >
+            {users.length === 0 && <option value="">No users</option>}
+            {users.map((u) => (
+              <option key={u.id} value={u.id}>
+                {u.name}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
 
       <nav className="flex flex-col gap-3">
         <NavItem to="/" icon={Mic2} label="Personalities" />
-        <NavItem to="/conversations" icon={MessageSquare} label="Conversations" />
+        <NavItem to="/conversations" icon={MessageSquare} label="Conversations" trailingIcon={Lock} />
         <NavItem to="/users" icon={Users} label="Users" />
-        <NavItem to="/settings" icon={Settings} label="Settings" />
+        <NavItem to="/settings" icon={Settings} label="AI Settings" />
       </nav>
 
-      <div className="mt-auto p-4 border-2 border-black bg-white shadow-[4px_4px_0px_0px_rgba(0,0,0,1)]">
+      <Link to="/models" className="mt-auto p-4 border-2 border-black bg-white rounded-[24px] hover:bg-[#fff3b0] transition-colors">
         <div className="flex items-center gap-2 mb-2">
           <div className="w-3 h-3 rounded-full bg-green-500 border border-black"></div>
-          <span className="text-xs font-bold">SYSTEM ONLINE</span>
+          <span className="text-xs font-bold">AI MODELS</span>
         </div>
         <div className="text-[10px] font-mono text-gray-500">
-          MEM: 64KB OK<br/>
-          CPU: ACTIVE
+          LLM: llama.cpp<br/>
+          TTS: NeuTTSAir
         </div>
-      </div>
+      </Link>
     </div>
   );
 };

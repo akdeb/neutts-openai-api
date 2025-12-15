@@ -1,47 +1,207 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api';
-import { Bot, User } from 'lucide-react';
+import { Bot, User, ArrowLeft } from 'lucide-react';
+import { useSearchParams } from 'react-router-dom';
 
 export const Conversations = () => {
-  const [conversations, setConversations] = useState<any[]>([]);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [sessions, setSessions] = useState<any[]>([]);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
+  const [thread, setThread] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadingThread, setLoadingThread] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadSessions = async () => {
+    try {
+      setError(null);
+      setLoading(true);
+      const data = await api.getSessions(100, 0);
+      setSessions(data);
+    } catch (e: any) {
+      setError(e?.message || 'Failed to load conversations');
+    } finally {
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
-    api.getConversations().then(setConversations);
+    let cancelled = false;
+
+    const run = async () => {
+      try {
+        setError(null);
+        const data = await api.getSessions(100, 0);
+        if (!cancelled) setSessions(data);
+      } catch (e: any) {
+        if (!cancelled) setError(e?.message || 'Failed to load conversations');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+
+    run();
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  useEffect(() => {
+    const id = searchParams.get('session');
+    if (!id) return;
+    if (selectedSessionId === id) return;
+    // Deep-link: open session thread and keep URL stable
+    openSession(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
+
+  const openSession = async (sessionId: string) => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set('session', sessionId);
+      return next;
+    });
+    setSelectedSessionId(sessionId);
+    setLoadingThread(true);
+    setError(null);
+    try {
+      const data = await api.getConversationsBySession(sessionId);
+      setThread(data);
+    } catch (e: any) {
+      setError(e?.message || 'Failed to load session thread');
+      setThread([]);
+    } finally {
+      setLoadingThread(false);
+    }
+  };
 
   return (
     <div>
-      <h2 className="text-3xl font-black mb-8">LOGS</h2>
-
-      <div className="bg-white border-2 border-black shadow-[4px_4px_0px_0px_rgba(0,0,0,1)]">
-        {conversations.map((c, i) => (
-          <div 
-            key={c.id} 
-            className={`p-4 flex gap-4 ${i !== conversations.length - 1 ? 'border-b-2 border-black' : ''} ${c.role === 'ai' ? 'bg-[#fdf6e3]' : ''}`}
+      <div className="flex items-center justify-between mb-8">
+        <h2 className="text-3xl font-black">CONVERSATIONS</h2>
+        {selectedSessionId && (
+          <button
+            type="button"
+            className="retro-btn bg-white"
+            onClick={() => {
+              setSelectedSessionId(null);
+              setThread([]);
+              setSearchParams((prev) => {
+                const next = new URLSearchParams(prev);
+                next.delete('session');
+                return next;
+              });
+            }}
           >
-            <div className={`w-8 h-8 shrink-0 border-2 border-black flex items-center justify-center shadow-[2px_2px_0px_0px_rgba(0,0,0,1)] ${c.role === 'ai' ? 'bg-[#2aa198]' : 'bg-[#ff6b6b]'}`}>
-              {c.role === 'ai' ? <Bot size={16} className="text-white" /> : <User size={16} className="text-white" />}
-            </div>
-            
-            <div className="flex-1">
-              <div className="flex justify-between items-start mb-1">
-                <span className="font-bold uppercase text-xs tracking-wider">
-                  {c.role === 'ai' ? 'SYSTEM' : 'OPERATOR'}
-                </span>
-                <span className="font-mono text-xs text-gray-500">
-                  {new Date(c.timestamp * 1000).toLocaleString()}
-                </span>
-              </div>
-              <p className="font-medium leading-relaxed">{c.transcript}</p>
-            </div>
-          </div>
-        ))}
-        {conversations.length === 0 && (
-          <div className="p-8 text-center font-mono text-gray-500">
-            NO DATA LOGGED
-          </div>
+            <span className="inline-flex items-center gap-2">
+              <ArrowLeft size={16} />
+              Back to Sessions
+            </span>
+          </button>
         )}
       </div>
+
+      {loading && (
+        <div className="retro-card font-mono text-sm mb-4">Loading…</div>
+      )}
+      {error && !loading && (
+        <div className="bg-white border-2 border-black rounded-[18px] px-4 py-4 mb-4 retro-shadow-sm">
+          <div className="text-xs font-bold uppercase tracking-wider text-red-700">Error</div>
+          <div className="font-mono text-sm text-gray-800 mt-2 break-words">{error}</div>
+          <div className="font-mono text-[11px] text-gray-500 mt-2">
+            Check that the API server is running and that your UI is pointing at the correct base URL.
+          </div>
+          <div className="mt-4 flex justify-end">
+            <button type="button" className="retro-btn" onClick={loadSessions}>
+              Retry
+            </button>
+          </div>
+        </div>
+      )}
+
+      {!selectedSessionId && !loading && !error && (
+        <div className="space-y-4">
+          {sessions.map((s: any) => (
+            <button
+              key={s.id}
+              type="button"
+              className="w-full text-left bg-white border border-black rounded-[18px] px-4 py-4 hover:bg-[#fff3b0] transition-colors retro-shadow-sm"
+              onClick={() => openSession(s.id)}
+            >
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <div className="text-xs font-bold uppercase tracking-wider">Session</div>
+                  <div className="font-mono text-xs text-gray-700 break-all">{s.id}</div>
+                </div>
+                <div className="text-right">
+                  <div className="text-xs font-bold uppercase tracking-wider">Client</div>
+                  <div className="font-mono text-xs text-gray-700">{s.client_type}</div>
+                </div>
+              </div>
+              <div className="mt-3 flex items-center justify-between">
+                <div className="font-mono text-xs text-gray-500">
+                  {s.started_at ? new Date(s.started_at * 1000).toLocaleString() : '—'}
+                </div>
+                <div className="font-mono text-xs text-gray-500">
+                  {typeof s.duration_sec === 'number' ? `${Math.round(s.duration_sec)}s` : ''}
+                </div>
+              </div>
+            </button>
+          ))}
+
+          {sessions.length === 0 && (
+            <div className="p-8 text-center font-mono text-gray-500 retro-card">
+              NO SESSIONS LOGGED
+            </div>
+          )}
+        </div>
+      )}
+
+      {selectedSessionId && (
+        <div className="space-y-4">
+          <div className="bg-white border border-black rounded-[18px] px-4 py-3 retro-shadow-sm">
+            <div className="text-xs font-bold uppercase tracking-wider">Session</div>
+            <div className="font-mono text-xs text-gray-700 break-all">{selectedSessionId}</div>
+          </div>
+
+          {loadingThread && (
+            <div className="retro-card font-mono text-sm">Loading session…</div>
+          )}
+
+          {!loadingThread && (
+            <div className="bg-white border border-black rounded-[18px] overflow-hidden retro-shadow-sm">
+              {thread.map((c: any, i: number) => (
+                <div
+                  key={c.id}
+                  className={`p-4 flex gap-4 ${i !== thread.length - 1 ? 'border-b border-black' : ''} ${c.role === 'ai' ? 'bg-[#f6f0e6]' : ''}`}
+                >
+                  <div className={`w-8 h-8 shrink-0 border border-black rounded-full flex items-center justify-center ${c.role === 'ai' ? 'bg-[#9b5cff]' : 'bg-[#00c853]'}`}>
+                    {c.role === 'ai' ? <Bot size={16} className="text-white" /> : <User size={16} className="text-white" />}
+                  </div>
+
+                  <div className="flex-1">
+                    <div className="flex justify-between items-start mb-1">
+                      <span className="font-bold uppercase text-xs tracking-wider">
+                        {c.role === 'ai' ? 'SYSTEM' : 'OPERATOR'}
+                      </span>
+                      <span className="font-mono text-xs text-gray-500">
+                        {new Date(c.timestamp * 1000).toLocaleString()}
+                      </span>
+                    </div>
+                    <p className="font-medium leading-relaxed">{c.transcript}</p>
+                  </div>
+                </div>
+              ))}
+
+              {thread.length === 0 && (
+                <div className="p-8 text-center font-mono text-gray-500">
+                  EMPTY SESSION
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 };
